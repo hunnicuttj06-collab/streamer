@@ -336,9 +336,10 @@ def install_dependencies():
 def launch(maven, project_root):
     args = ["-B", "compile", "exec:java"]
     if platform.system() == "Windows" and Path(maven).suffix.lower() in (".cmd", ".bat"):
-        # cmd.exe must interpret .cmd launchers; quote the executable path separately.
-        command = f'"{maven}" ' + " ".join(args)
-        return subprocess.call([os.environ.get("COMSPEC", "cmd.exe"), "/d", "/s", "/c", command],
+        # Start cmd with a command string that begins with CALL. Avoid /s and nested
+        # quoting, which can make cmd.exe treat the quoted Maven path as a literal token.
+        command = f'call "{maven}" ' + " ".join(args)
+        return subprocess.call([os.environ.get("COMSPEC", "cmd.exe"), "/d", "/c", command],
                                cwd=project_root)
     return subprocess.call([maven, *args], cwd=project_root)
 
