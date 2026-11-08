@@ -29,8 +29,12 @@ final class TelegramChannelResolver {
         if (isInviteLink(link)) {
             // Joining is an explicit consequence of supplying an invite link. Telegram still
             // enforces invite validity and account access; no private access is bypassed.
-            return client.send(new TdApi.JoinChatByInviteLink(link))
+            TdApi.ChatJoinResult result = client.send(new TdApi.JoinChatByInviteLink(link))
                     .get(timeout.toMinutes(), TimeUnit.MINUTES);
+            if (result.chatId != 0L) {
+                return getChat(client, result.chatId, timeout);
+            }
+            throw new IllegalStateException("Telegram invite link did not resolve to a chat.");
         }
 
         String username = usernameFromLink(link);
@@ -49,7 +53,7 @@ final class TelegramChannelResolver {
 
     private static TdApi.Chat findKnownChatByTitle(
             SimpleTelegramClient client, String title, Duration timeout) throws Exception {
-        TdApi.Chats results = client.send(new TdApi.SearchChats(title, 100))
+        TdApi.Chats results = client.send(new TdApi.SearchChats(title, null, 100))
                 .get(timeout.toMinutes(), TimeUnit.MINUTES);
         List<TdApi.Chat> matches = new ArrayList<>();
         if (results.chatIds != null) {
