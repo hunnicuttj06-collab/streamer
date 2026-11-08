@@ -1,248 +1,367 @@
 #!/usr/bin/env python3
-"""One-command setup and launch for the Telegram channel playlist player."""
+"""Install/check prerequisites and launch the Telegram playlist player."""
 
+import hashlib
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import urllib.error
 import urllib.request
 import zipfile
 from pathlib import Path
 
-
-MAC_PACKAGES = [
-    ("java", "openjdk@17"),
-    ("mvn", "maven"),
-    ("ffmpeg", "ffmpeg"),
-]
-WINDOWS_PACKAGES = [
-    ("java", "EclipseAdoptium.Temurin.17.JDK"),
-    ("ffmpeg", "Gyan.FFmpeg.Shared"),
-]
 MAVEN_VERSION = "3.9.11"
-MAVEN_HOME_NAME = f"apache-maven-{MAVEN_VERSION}"
+MAVEN_DIR = f"apache-maven-{MAVEN_VERSION}"
+WINDOWS_PACKAGES = {
+    "java": "EclipseAdoptium.Temurin.17.JDK",
+    "ffmpeg": "Gyan.FFmpeg.Shared",
+}
 
 
-def run(command, check=True):
-    print("+", " ".join(str(part) for part in command), flush=True)
-    return subprocess.run(command, check=check)
+def run(command, *, check=True, capture=False, timeout=None):
+    printable = " ".join(str(part) for part in command)
+    print("+", printable, flush=True)
+    return subprocess.run(
+        command,
+        check=check,
+        text=True,
+        stdout=subprocess.PIPE if capture else None,
+        stderr=subprocess.STDOUT if capture else None,
+        timeout=timeout,
+    )
+
+
+def prepend_path(directory):
+    directory = str(directory)
+    entries = os.environ.get("PATH", "").split(os.pathsep)
+    if not any(item.casefold() == directory.casefold() for item in entries):
+        os.environ["PATH"] = directory + os.pathsep + os.environ.get("PATH", "")
 
 
 def refresh_windows_path():
-    """Merge PATH values from the Windows registry into this Python process."""
+    """Refresh PATH in this process after WinGet changes the user/machine PATH."""
     if platform.system() != "Windows":
         return
     try:
         import winreg
-        paths = [os.environ.get("PATH", "")]
-        locations = [
+        values = [os.environ.get("PATH", "")]
+        for hive, key in (
             (winreg.HKEY_CURRENT_USER, r"Environment"),
             (winreg.HKEY_LOCAL_MACHINE,
              r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment"),
-        ]
-        for hive, key in locations:
+        ):
             try:
                 with winreg.OpenKey(hive, key) as registry_key:
                     value, _ = winreg.QueryValueEx(registry_key, "Path")
-                    paths.append(os.path.expandvars(value))
+                    values.append(os.path.expandvars(value))
             except OSError:
-                pass
-        combined = []
-        seen = set()
-        for value in paths:
-            for item in value.split(os.pathsep):
-                item = item.strip().strip('"')
-                if item and item.casefold() not in seen:
-                    combined.append(item)
-                    seen.add(item.casefold())
+                continue
+        combined, seen = [], set()
+        for value in values:
+            for entry in value.split(os.pathsep):
+                entry = entry.strip().strip('"')
+                if entry and entry.casefold() not in seen:
+                    seen.add(entry.casefold())
+                    combined.append(entry)
         os.environ["PATH"] = os.pathsep.join(combined)
     except ImportError:
-        pass
+        return
 
 
-def windows_tool_candidates(tool):
-    """Check normal PATH and common package-manager install locations."""
+def local_app_data():
+    return Path(os.environ.get("LOCALAPPDATA", Path.home()))
+
+
+def candidate_executables(tool):
+    """Check standard install locations without crawling all of Program Files."""
     refresh_windows_path()
     found = shutil.which(tool)
     if found:
-        return found
+        yield Path(found)
 
-    suffixes = (".exe", ".cmd", ".bat")
-    names = [tool + suffix for suffix in suffixes]
-    local = Path(os.environ.get("LOCALAPPDATA", Path.home()))
     program_files = Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
     roots = []
     if tool == "java":
-        roots.extend([program_files / "Eclipse Adoptium", program_files / "Java",
-                      local / "Programs", local / "Microsoft" / "WinGet" / "Packages"])
-    elif tool in ("ffmpeg", "ffprobe"):
-        roots.extend([program_files / "FFmpeg", local / "Programs" / "ffmpeg",
-                      local / "Microsoft" / "WinGet" / "Packages"])
+        roots.extend([
+            program_files / "Eclipse Adoptium",
+            program_files / "Java",
+            local_app_data() / "Programs" / "Eclipse Adoptium",
+        ])
+        package_root = local_app_data() / "Microsoft" / "WinGet" / "Packages"
+        roots.extend(package_root.glob("EclipseAdoptium.Temurin.17.JDK_*"))
+        names = ("java.exe",)
+    else:
+        roots.extend([
+            Path(r"C:\ffmpeg\bin"),
+            program_files / "ffmpeg" / "bin",
+            local_app_data() / "Programs" / "ffmpeg" / "bin",
+        ])
+        package_root = local_app_data() / "Microsoft" / "WinGet" / "Packages"
+        roots.extend(package_root.glob("Gyan.FFmpeg.Shared_*"))
+        names = ("ffmpeg.exe", "ffprobe.exe")
 
+    yielded = set()
     for root in roots:
-        if not root.is_dir():
+        if not root.exists():
             continue
-        # Walk only known directories and stop at the executable to cover versioned package layouts.
-        try:
+        direct = [root / name for name in names]
+        direct.extend(root / "bin" / name for name in names)
+        for candidate in direct:
+            if candidate.is_file() and str(candidate).casefold() not in yielded:
+                yielded.add(str(candidate).casefold())
+                yield candidate
+        # WinGet installs may include versioned subdirectories; search only that package root.
+        if root.name.startswith(("Eclipse Adoptium", "Java", "EclipseAdoptium.", "Gyan.")):
             for name in names:
-                matches = root.glob(f"**/{name}")
-                candidate = next(matches, None)
-                if candidate and candidate.is_file():
-                    os.environ["PATH"] = str(candidate.parent) + os.pathsep + os.environ.get("PATH", "")
-                    return str(candidate)
-        except (OSError, PermissionError):
-            continue
+                try:
+                    for candidate in root.glob(f"**/{name}"):
+                        if candidate.is_file() and str(candidate).casefold() not in yielded:
+                            yielded.add(str(candidate).casefold())
+                            yield candidate
+                except (OSError, PermissionError):
+                    continue
+
+
+def resolve_windows_tool(tool):
+    for candidate in candidate_executables(tool):
+        prepend_path(candidate.parent)
+        return str(candidate)
     return None
 
 
-def windows_maven_candidates():
-    candidates = []
+def java_version(java_command):
+    try:
+        result = run([java_command, "-version"], check=False, capture=True, timeout=20)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    output = result.stdout or ""
+    match = re.search(r'version\s+"?([0-9]+)(?:\.([0-9]+))?', output, re.IGNORECASE)
+    if not match:
+        match = re.search(r"openjdk\s+([0-9]+)(?:\.([0-9]+))?", output, re.IGNORECASE)
+    return int(match.group(1)) if match else None
+
+
+def valid_java(java_command):
+    version = java_version(java_command)
+    if version is not None and version >= 17:
+        print(f"Using Java {version}: {java_command}")
+        return True
+    if version is not None:
+        print(f"Found Java {version}; this project needs Java 17 or newer.")
+    return False
+
+
+def install_windows_package(tool, package_id):
+    current = resolve_windows_tool(tool)
+    if tool == "java" and current and valid_java(current):
+        return current
+    if tool != "java" and current:
+        return current
+
+    winget = shutil.which("winget")
+    if not winget:
+        raise RuntimeError("WinGet is unavailable. Install/update App Installer, then rerun this script.")
+
+    # Do not let WinGet's nonzero 'already installed/no upgrade' result abort setup.
+    result = run([
+        winget, "install", "--id", package_id, "--exact", "--source", "winget",
+        "--accept-source-agreements", "--accept-package-agreements",
+    ], check=False)
+    refresh_windows_path()
+    current = resolve_windows_tool(tool)
+    if current and (tool != "java" or valid_java(current)):
+        return current
+
+    if result.returncode != 0:
+        print(f"WinGet returned {result.returncode} while handling {package_id}; "
+              "checking known install paths did not find a usable tool.")
+    raise RuntimeError(
+        f"Could not find a usable {tool} after the WinGet install attempt. "
+        "Check the WinGet output above, then reopen PowerShell and run `python scripts\\setup.py` again."
+    )
+
+
+def find_maven_windows():
+    command = shutil.which("mvn")
+    if command:
+        return command
+
+    homes = []
     configured = os.environ.get("MAVEN_HOME") or os.environ.get("M2_HOME")
     if configured:
-        candidates.append(Path(configured))
+        homes.append(Path(configured))
     for entry in os.environ.get("PATH", "").split(os.pathsep):
         if entry:
-            path = Path(entry.strip('"'))
-            if path.name.lower() == "bin":
-                candidates.append(path.parent)
-    local = Path(os.environ.get("LOCALAPPDATA", Path.home()))
-    program_files = Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
-    candidates.extend([
-        local / "streamer" / "tools" / MAVEN_HOME_NAME,
-        local / "Programs" / MAVEN_HOME_NAME,
-        program_files / "Apache" / "Maven",
+            candidate = Path(entry.strip('"'))
+            if candidate.name.casefold() == "bin":
+                homes.append(candidate.parent)
+    local = local_app_data()
+    homes.extend([
+        local / "streamer" / "tools" / MAVEN_DIR,
+        local / "Programs" / MAVEN_DIR,
+        Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Apache" / "Maven",
         Path(r"C:\tools\apache-maven"),
     ])
     tools = local / "streamer" / "tools"
     if tools.is_dir():
-        candidates.extend(sorted(tools.glob("apache-maven-*"), reverse=True))
+        homes.extend(sorted(tools.glob("apache-maven-*"), reverse=True))
+
     seen = set()
-    for home in candidates:
+    for home in homes:
         try:
-            canonical = home.expanduser().resolve()
+            home = home.expanduser().resolve()
         except OSError:
             continue
-        if canonical not in seen:
-            seen.add(canonical)
-            yield canonical
-
-
-def find_windows_maven():
-    command = shutil.which("mvn")
-    if command:
-        return command
-    for home in windows_maven_candidates():
+        if home in seen:
+            continue
+        seen.add(home)
         for name in ("mvn.cmd", "mvn.bat", "mvn.exe"):
-            candidate = home / "bin" / name
-            if candidate.is_file():
-                return str(candidate)
+            executable = home / "bin" / name
+            if executable.is_file():
+                prepend_path(executable.parent)
+                return str(executable)
     return None
 
 
+def download_file(url, destination):
+    request = urllib.request.Request(url, headers={"User-Agent": "streamer-setup/1.0"})
+    with urllib.request.urlopen(request, timeout=60) as response, destination.open("wb") as output:
+        shutil.copyfileobj(response, output)
+
+
 def install_maven_windows():
-    existing = find_windows_maven()
+    existing = find_maven_windows()
     if existing:
-        os.environ["PATH"] = str(Path(existing).parent) + os.pathsep + os.environ.get("PATH", "")
         print(f"Using Maven at {existing}")
         return existing
 
-    local = Path(os.environ.get("LOCALAPPDATA", Path.home()))
-    install_root = local / "streamer" / "tools"
-    maven_home = install_root / MAVEN_HOME_NAME
-    executable = maven_home / "bin" / "mvn.cmd"
-    url = (f"https://archive.apache.org/dist/maven/maven-3/{MAVEN_VERSION}/binaries/"
-           f"{MAVEN_HOME_NAME}-bin.zip")
+    install_root = local_app_data() / "streamer" / "tools"
     install_root.mkdir(parents=True, exist_ok=True)
+    target = install_root / MAVEN_DIR
+    base_url = (f"https://archive.apache.org/dist/maven/maven-3/{MAVEN_VERSION}/binaries/"
+                f"{MAVEN_DIR}-bin.zip")
     print(f"Maven was not found. Downloading Apache Maven {MAVEN_VERSION}...", flush=True)
 
-    with tempfile.TemporaryDirectory(prefix="streamer-maven-") as temporary:
-        archive = Path(temporary) / "maven.zip"
-        urllib.request.urlretrieve(url, archive)
-        with zipfile.ZipFile(archive) as bundle:
-            base = Path(temporary).resolve()
-            for item in bundle.infolist():
-                destination = (base / item.filename).resolve()
-                if destination != base and base not in destination.parents:
-                    raise RuntimeError("The Maven archive contains an unsafe path.")
-            bundle.extractall(base)
-        extracted = base / MAVEN_HOME_NAME
-        if not (extracted / "bin" / "mvn.cmd").is_file():
-            raise RuntimeError("The Apache Maven archive did not contain bin\\mvn.cmd.")
-        if maven_home.exists():
-            shutil.rmtree(maven_home)
-        shutil.move(str(extracted), str(maven_home))
+    with tempfile.TemporaryDirectory(prefix="streamer-maven-") as temporary_name:
+        temporary = Path(temporary_name)
+        archive = temporary / "maven.zip"
+        checksum_file = temporary / "maven.zip.sha512"
+        download_file(base_url, archive)
+        download_file(base_url + ".sha512", checksum_file)
+        expected = re.search(r"\b([0-9a-fA-F]{128})\b", checksum_file.read_text(
+            encoding="ascii", errors="replace"))
+        if not expected:
+            raise RuntimeError("Apache Maven checksum file was missing or unreadable; refusing an unverified download.")
+        digest = hashlib.sha512(archive.read_bytes()).hexdigest()
+        if digest.lower() != expected.group(1).lower():
+            raise RuntimeError("Apache Maven download failed SHA-512 verification; refusing to install it.")
 
-    os.environ["MAVEN_HOME"] = str(maven_home)
-    os.environ["PATH"] = str(executable.parent) + os.pathsep + os.environ.get("PATH", "")
-    print(f"Maven installed at {maven_home}")
+        extracted_root = temporary / "unpacked"
+        extracted_root.mkdir()
+        with zipfile.ZipFile(archive) as bundle:
+            root = extracted_root.resolve()
+            for item in bundle.infolist():
+                destination = (root / item.filename).resolve()
+                if destination != root and root not in destination.parents:
+                    raise RuntimeError("The Maven archive contains an unsafe path.")
+            bundle.extractall(root)
+        extracted = extracted_root / MAVEN_DIR
+        if not (extracted / "bin" / "mvn.cmd").is_file():
+            raise RuntimeError("The verified Apache Maven archive did not contain bin\\mvn.cmd.")
+
+        replacement = install_root / (MAVEN_DIR + ".new")
+        if replacement.exists():
+            shutil.rmtree(replacement)
+        shutil.move(str(extracted), str(replacement))
+        if target.exists():
+            shutil.rmtree(target)
+        replacement.replace(target)
+
+    executable = target / "bin" / "mvn.cmd"
+    os.environ["MAVEN_HOME"] = str(target)
+    prepend_path(executable.parent)
+    print(f"Maven installed at {target}")
     return str(executable)
 
 
-def install_windows_tool(tool, package_id):
-    if windows_tool_candidates(tool):
-        return
-    winget = shutil.which("winget")
-    if not winget:
-        sys.exit("WinGet is unavailable. Install/update App Installer, then run `python scripts\\setup.py` again.")
-
-    result = run([winget, "install", "--id", package_id,
-                  "--accept-source-agreements", "--accept-package-agreements"], check=False)
-    refresh_windows_path()
-    if windows_tool_candidates(tool):
-        return
-
-    # WinGet can return a non-zero 'already installed/no upgrade' result. Re-check locations
-    # before treating it as a true installation failure.
-    if result.returncode != 0:
-        sys.exit(f"WinGet could not find a usable {tool} installation (exit code {result.returncode}). "
-                 "Check the install output above, then reopen PowerShell and run `python scripts\\setup.py` again.")
-    sys.exit(f"WinGet completed for {package_id}, but {tool} is not available yet. "
-             "Close and reopen PowerShell, then run `python scripts\\setup.py` again.")
+def install_mac_dependencies():
+    brew = shutil.which("brew")
+    if not brew:
+        raise RuntimeError("Homebrew is required. Install it from https://brew.sh, then rerun this script.")
+    for tool, package in (("java", "openjdk@17"), ("mvn", "maven"),
+                          ("ffmpeg", "ffmpeg")):
+        if tool == "java":
+            found = shutil.which("java")
+            if found and valid_java(found):
+                continue
+        elif shutil.which(tool):
+            continue
+        run([brew, "install", package])
+    java_prefix = run([brew, "--prefix", "openjdk@17"], capture=True, timeout=30).stdout.strip()
+    if java_prefix:
+        prepend_path(Path(java_prefix) / "bin")
+    return shutil.which("mvn")
 
 
 def install_dependencies():
     system = platform.system()
-    if system == "Darwin":
-        brew = shutil.which("brew")
-        if not brew:
-            sys.exit("Homebrew is not installed. Install it once from https://brew.sh, then rerun the setup command.")
-        missing = sorted({package for tool, package in MAC_PACKAGES if not shutil.which(tool)})
-        if missing:
-            run([brew, "install", *missing])
-        maven = shutil.which("mvn")
-    elif system == "Windows":
-        for tool, package in WINDOWS_PACKAGES:
-            install_windows_tool(tool, package)
-        maven = install_maven_windows()
-    else:
-        sys.exit("This one-command setup supports macOS and Windows.")
-
     if system == "Windows":
-        missing = [tool for tool in ("java", "ffmpeg", "ffprobe")
-                   if not windows_tool_candidates(tool)]
-    else:
-        missing = [tool for tool in ("java", "ffmpeg", "ffprobe") if not shutil.which(tool)]
-    if not maven:
-        missing.append("mvn")
-    if missing:
-        sys.exit("Required tools could not be found: " + ", ".join(missing)
-                 + ". Run `python scripts\\setup.py` again after installing them.")
-    return maven
+        install_windows_package("java", WINDOWS_PACKAGES["java"])
+        install_windows_package("ffmpeg", WINDOWS_PACKAGES["ffmpeg"])
+        maven = install_maven_windows()
+        java = resolve_windows_tool("java")
+        ffmpeg = resolve_windows_tool("ffmpeg")
+        ffprobe = resolve_windows_tool("ffprobe")
+        if not java or not valid_java(java):
+            raise RuntimeError("Java 17 or newer could not be located after setup.")
+        if not ffmpeg or not ffprobe:
+            raise RuntimeError("FFmpeg/FFprobe could not be located. Install the FFmpeg package, then retry.")
+        return maven
+    if system == "Darwin":
+        maven = install_mac_dependencies()
+        missing = [tool for tool in ("java", "mvn", "ffmpeg", "ffprobe") if not shutil.which(tool)]
+        java = shutil.which("java")
+        if java and not valid_java(java):
+            missing.append("Java 17+")
+        if missing:
+            raise RuntimeError("Required tools are still unavailable: " + ", ".join(missing))
+        return maven
+    raise RuntimeError("This setup script supports macOS and Windows.")
+
+
+def launch(maven, project_root):
+    args = ["-B", "compile", "exec:java"]
+    if platform.system() == "Windows" and Path(maven).suffix.lower() in (".cmd", ".bat"):
+        # cmd.exe must interpret .cmd launchers; quote the executable path separately.
+        command = f'"{maven}" ' + " ".join(args)
+        return subprocess.call([os.environ.get("COMSPEC", "cmd.exe"), "/d", "/s", "/c", command],
+                               cwd=project_root)
+    return subprocess.call([maven, *args], cwd=project_root)
 
 
 def main():
     if sys.version_info < (3, 8):
-        sys.exit("Python 3.8 or newer is required.")
-    maven = install_dependencies()
+        print("Python 3.8 or newer is required.", file=sys.stderr)
+        return 1
+    try:
+        maven = install_dependencies()
+    except (RuntimeError, OSError, urllib.error.URLError, zipfile.BadZipFile,
+            subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+        print(f"Setup failed: {error}", file=sys.stderr)
+        return 1
+
     project_root = Path(__file__).resolve().parent.parent
-    print("\nStarting setup. The app will ask for any missing Telegram details one at a time.")
-    print("After the player opens, start screen sharing manually in Telegram Desktop.\n")
-    command = [maven, "-B", "compile", "exec:java"]
-    if platform.system() == "Windows" and Path(maven).suffix.lower() in (".cmd", ".bat"):
-        command = [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/s", "/c", "\"" + " ".join(command) + "\""]
-    return subprocess.call(command, cwd=project_root)
+    print("\nStarting the player. Missing Telegram details will be requested one at a time.")
+    print("When the player opens, share its browser window manually in Telegram Desktop.\n")
+    try:
+        return launch(maven, project_root)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        print(f"Could not start Maven: {error}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
