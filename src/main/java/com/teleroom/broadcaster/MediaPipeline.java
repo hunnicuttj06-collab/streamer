@@ -7,14 +7,19 @@ import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.FileTime;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.TreeMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
 final class MediaPipeline {
     private static final String VIDEO_FILTER = "scale=1280:720:force_original_aspect_ratio=decrease,"
             + "pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,format=yuv420p";
+    private static final String CACHE_VERSION = "media-v2";
+    private static final int VIDEO_ENCODER_THREADS = 2;
     private final String ffmpeg;
     private final String ffprobe;
     private final ProcessRunner processRunner;
@@ -46,25 +51,95 @@ final class MediaPipeline {
     }
 
     private void normalize(Path input, Path output, long messageId) throws Exception {
-        boolean hasAudio = hasAudioStream(input, messageId);
+        String cacheKey = cacheKey(input);
+        Path metadata = output.resolveSibling(output.getFileName() + ".meta");
+        if (Files.isRegularFile(output) && Files.size(output) > 0
+                && Files.isRegularFile(metadata) && Files.readString(metadata).equals(cacheKey)) {
+            System.out.printf("Reusing prepared video for message %d.%n", messageId);
+            return;
+        }
+
+        ProbeInfo probe = probe(input, messageId);
+        boolean hasAudio = probe.hasAudio();
         List<String> command = new ArrayList<>(List.of(ffmpeg, "-hide_banner", "-nostdin",
                 "-loglevel", "error", "-y", "-i", input.toAbsolutePath().toString()));
         if (!hasAudio) command.addAll(List.of("-f", "lavfi", "-i",
                 "anullsrc=channel_layout=stereo:sample_rate=44100"));
-        command.addAll(List.of("-map", "0:v:0", "-map", hasAudio ? "0:a:0" : "1:a:0",
-                "-vf", VIDEO_FILTER, "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-                "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
-                "-ac", "2", "-af", "apad", "-shortest", "-movflags", "+faststart",
-                output.toAbsolutePath().toString()));
+        command.addAll(List.of("-map", "0:v:0", "-map", hasAudio ? "0:a:0" : "1:a:0"));
+
+        if (probe.canCopyVideo()) {
+            // Avoid the expensive decode/scale/re-encode path for browser-friendly 720p H.264.
+            command.addAll(List.of("-c:v", "copy"));
+        } else {
+            command.addAll(List.of("-vf", VIDEO_FILTER, "-c:v", "libx264", "-preset", "veryfast",
+                    "-crf", "23", "-threads:v", Integer.toString(VIDEO_ENCODER_THREADS),
+                    "-pix_fmt", "yuv420p"));
+        }
+        if (hasAudio && probe.audioCodec().equals("aac")) {
+            command.addAll(List.of("-c:a", "copy"));
+        } else {
+            command.addAll(List.of("-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2",
+                    "-af", "apad"));
+        }
+        command.addAll(List.of("-shortest", "-movflags", "+faststart", output.toAbsolutePath().toString()));
         processRunner.run(command);
+        Files.writeString(metadata, cacheKey, StandardCharsets.UTF_8);
     }
 
-    private boolean hasAudioStream(Path input, long messageId) throws Exception {
-        String output = processRunner.capture(List.of(ffprobe, "-v", "error", "-select_streams", "a:0",
-                "-show_entries", "stream=codec_type", "-of", "csv=p=0", input.toAbsolutePath().toString()),
-                "FFprobe for message " + messageId);
-        return output.lines().anyMatch(line -> line.trim().equals("audio"));
+    private ProbeInfo probe(Path input, long messageId) throws Exception {
+        String output = processRunner.capture(List.of(ffprobe, "-v", "error", "-show_entries",
+                "stream=codec_type,codec_name,width,height,pix_fmt", "-of", "flat",
+                input.toAbsolutePath().toString()), "FFprobe for message " + messageId);
+        Map<Integer, Map<String, String>> streams = new TreeMap<>();
+        for (String line : output.lines().toList()) {
+            int prefixEnd = line.indexOf('=');
+            if (prefixEnd < 0) continue;
+            String key = line.substring(0, prefixEnd);
+            if (!key.startsWith("streams.stream.")) continue;
+            int fieldStart = "streams.stream.".length();
+            int fieldEnd = key.indexOf('.', fieldStart);
+            if (fieldEnd < 0) continue;
+            try {
+                int index = Integer.parseInt(key.substring(fieldStart, fieldEnd));
+                String value = line.substring(prefixEnd + 1).trim();
+                if (value.length() >= 2 && value.startsWith("\"") && value.endsWith("\"")) {
+                    value = value.substring(1, value.length() - 1);
+                }
+                streams.computeIfAbsent(index, ignored -> new TreeMap<>())
+                        .put(key.substring(fieldEnd + 1), value);
+            } catch (NumberFormatException ignored) {
+                // Ignore unexpected FFprobe output lines.
+            }
+        }
+
+        Map<String, String> video = streams.values().stream()
+                .filter(stream -> "video".equals(stream.get("codec_type"))).findFirst().orElse(Map.of());
+        Map<String, String> audio = streams.values().stream()
+                .filter(stream -> "audio".equals(stream.get("codec_type"))).findFirst().orElse(Map.of());
+        if (video.isEmpty()) throw new IOException("No video stream found for message " + messageId + ".");
+        int width = parseDimension(video.get("width"));
+        int height = parseDimension(video.get("height"));
+        boolean canCopyVideo = "h264".equals(video.get("codec_name"))
+                && "yuv420p".equals(video.get("pix_fmt"))
+                && width > 0 && width <= 1280 && height > 0 && height <= 720;
+        return new ProbeInfo(!audio.isEmpty(), canCopyVideo, audio.getOrDefault("codec_name", ""));
     }
+
+    private static int parseDimension(String value) {
+        try {
+            return Integer.parseInt(value);
+        } catch (NumberFormatException | NullPointerException exception) {
+            return -1;
+        }
+    }
+
+    private static String cacheKey(Path input) throws IOException {
+        Path absolute = input.toAbsolutePath().normalize();
+        FileTime modified = Files.getLastModifiedTime(absolute);
+        return CACHE_VERSION + "\n" + absolute + "\n" + Files.size(absolute) + "\n" + modified.toMillis();
+    }
+
+    private record ProbeInfo(boolean hasAudio, boolean canCopyVideo, String audioCodec) { }
 
     static final class ProcessRunner {
         private final AtomicReference<Process> activeProcess = new AtomicReference<>();
