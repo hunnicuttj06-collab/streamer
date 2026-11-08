@@ -27,14 +27,15 @@ final class TelegramChannelResolver {
 
         String link = normalizedTelegramLink(value);
         if (isInviteLink(link)) {
-            // Joining is an explicit consequence of supplying an invite link. Telegram still
-            // enforces invite validity and account access; no private access is bypassed.
+            // JoinChatByInviteLink returns a ChatJoinResult subtype, not a chatId field.
+            // Only the Chat subtype directly contains the resolved chat.
             TdApi.ChatJoinResult result = client.send(new TdApi.JoinChatByInviteLink(link))
                     .get(timeout.toMinutes(), TimeUnit.MINUTES);
-            if (result.chatId != 0L) {
-                return getChat(client, result.chatId, timeout);
+            if (result instanceof TdApi.ChatJoinResult.Chat joined && joined.chat != null) {
+                return joined.chat;
             }
-            throw new IllegalStateException("Telegram invite link did not resolve to a chat.");
+            throw new IllegalStateException("Telegram did not return a chat for this invite link. "
+                    + "If you already joined the channel, use its chat ID, public link, or exact title.");
         }
 
         String username = usernameFromLink(link);
