@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install the broadcaster's external tools on macOS or Windows."""
+"""One-command setup and launch for the Telegram channel playlist player."""
 
 import platform
 import shutil
@@ -26,46 +26,48 @@ def run(command):
     subprocess.run(command, check=True)
 
 
-def main():
-    if sys.version_info < (3, 8):
-        sys.exit("Python 3.8 or newer is required to run this setup script.")
-
+def install_dependencies():
     system = platform.system()
     if system == "Darwin":
-        if not shutil.which("brew"):
-            sys.exit("Homebrew is required. Install it from https://brew.sh, then rerun this script.")
-        missing = sorted({package for command, package in MAC_PACKAGES
-                          if not shutil.which(command)})
+        brew = shutil.which("brew")
+        if not brew:
+            sys.exit("Homebrew is not installed. Install it once from https://brew.sh, then rerun this script.")
+        missing = sorted({package for tool, package in MAC_PACKAGES if not shutil.which(tool)})
         if missing:
-            run(["brew", "install", *missing])
+            run([brew, "install", *missing])
     elif system == "Windows":
         winget = shutil.which("winget")
         if not winget:
-            sys.exit("WinGet is required. Install/update 'App Installer' from Microsoft Store, then rerun.")
+            sys.exit("WinGet is unavailable. Install/update App Installer, then rerun this script.")
         missing = []
-        installed_packages = set()
-        for command, package in WINDOWS_PACKAGES:
-            if not shutil.which(command) and package not in installed_packages:
+        installed = set()
+        for tool, package in WINDOWS_PACKAGES:
+            if not shutil.which(tool) and package not in installed:
                 missing.append(package)
-                installed_packages.add(package)
+                installed.add(package)
         for package in missing:
             run([winget, "install", "--id", package,
                  "--accept-source-agreements", "--accept-package-agreements"])
     else:
-        sys.exit("This one-script installer supports macOS and Windows only.")
+        sys.exit("This one-command setup supports macOS and Windows.")
 
-    absent = [name for name in ("java", "mvn", "ffmpeg", "ffprobe")
-              if not shutil.which(name)]
-    if absent:
-        print("Installed dependencies may not yet be on this terminal's PATH: "
-              + ", ".join(absent))
-        print("Open a new terminal, then rerun this setup script to verify installations.")
-        return 1
+    missing_tools = [tool for tool in ("java", "mvn", "ffmpeg", "ffprobe")
+                     if not shutil.which(tool)]
+    if missing_tools:
+        sys.exit("Some installed tools are not visible in this terminal yet: "
+                 + ", ".join(missing_tools)
+                 + ". Close and reopen the terminal, then run this same command again.")
 
-    print("Java, Maven, FFmpeg, and FFprobe are ready.")
-    print("Next, set TELEGRAM_API_ID, TELEGRAM_API_HASH, TELEGRAM_CHANNEL, and "
-          "TELEGRAM_STREAM_KEY, then run the project with Maven.")
-    return 0
+
+def main():
+    if sys.version_info < (3, 8):
+        sys.exit("Python 3.8 or newer is required.")
+
+    install_dependencies()
+    project_root = __import__("pathlib").Path(__file__).resolve().parent.parent
+    print("\nStarting setup. The app will ask for any missing Telegram details one at a time.")
+    print("After the player opens, start screen sharing manually in Telegram Desktop.\n")
+    return subprocess.call(["mvn", "-B", "compile", "exec:java"], cwd=project_root)
 
 
 if __name__ == "__main__":
