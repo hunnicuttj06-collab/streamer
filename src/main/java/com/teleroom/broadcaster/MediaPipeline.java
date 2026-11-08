@@ -35,19 +35,9 @@ final class MediaPipeline {
         processRunner.capture(List.of(ffprobe, "-version"), "FFprobe");
     }
 
-    List<WebPlaylistServer.Video> prepareForWeb(
-            List<TelegramChannelPlaylist.DownloadedVideo> videos, Path outputDirectory) throws Exception {
-        Files.createDirectories(outputDirectory);
-        List<WebPlaylistServer.Video> result = new ArrayList<>(videos.size());
-        for (int i = 0; i < videos.size(); i++) {
-            var video = videos.get(i);
-            String name = String.format("video-%06d.mp4", i + 1);
-            Path output = outputDirectory.resolve(name);
-            System.out.printf("Preparing video %d of %d for the web player.%n", i + 1, videos.size());
-            normalize(video.path(), output, video.messageId());
-            result.add(new WebPlaylistServer.Video(name, "Video " + (i + 1)));
-        }
-        return List.copyOf(result);
+    void prepareVideo(Path input, Path output, long messageId) throws Exception {
+        Files.createDirectories(output.toAbsolutePath().getParent());
+        normalize(input, output, messageId);
     }
 
     private void normalize(Path input, Path output, long messageId) throws Exception {
@@ -60,22 +50,20 @@ final class MediaPipeline {
         }
 
         ProbeInfo probe = probe(input, messageId);
-        boolean hasAudio = probe.hasAudio();
         List<String> command = new ArrayList<>(List.of(ffmpeg, "-hide_banner", "-nostdin",
                 "-loglevel", "error", "-y", "-i", input.toAbsolutePath().toString()));
-        if (!hasAudio) command.addAll(List.of("-f", "lavfi", "-i",
+        if (!probe.hasAudio()) command.addAll(List.of("-f", "lavfi", "-i",
                 "anullsrc=channel_layout=stereo:sample_rate=44100"));
-        command.addAll(List.of("-map", "0:v:0", "-map", hasAudio ? "0:a:0" : "1:a:0"));
+        command.addAll(List.of("-map", "0:v:0", "-map", probe.hasAudio() ? "0:a:0" : "1:a:0"));
 
         if (probe.canCopyVideo()) {
-            // Avoid the expensive decode/scale/re-encode path for browser-friendly 720p H.264.
             command.addAll(List.of("-c:v", "copy"));
         } else {
             command.addAll(List.of("-vf", VIDEO_FILTER, "-c:v", "libx264", "-preset", "veryfast",
                     "-crf", "23", "-threads:v", Integer.toString(VIDEO_ENCODER_THREADS),
                     "-pix_fmt", "yuv420p"));
         }
-        if (hasAudio && probe.audioCodec().equals("aac")) {
+        if (probe.hasAudio() && probe.audioCodec().equals("aac")) {
             command.addAll(List.of("-c:a", "copy"));
         } else {
             command.addAll(List.of("-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2",
@@ -111,7 +99,6 @@ final class MediaPipeline {
                 // Ignore unexpected FFprobe output lines.
             }
         }
-
         Map<String, String> video = streams.values().stream()
                 .filter(stream -> "video".equals(stream.get("codec_type"))).findFirst().orElse(Map.of());
         Map<String, String> audio = streams.values().stream()

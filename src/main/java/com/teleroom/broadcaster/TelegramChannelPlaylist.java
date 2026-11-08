@@ -8,10 +8,8 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Comparator;
-import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
-import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 
@@ -22,38 +20,31 @@ final class TelegramChannelPlaylist {
 
     private TelegramChannelPlaylist() { }
 
-    static List<DownloadedVideo> download(SimpleTelegramClient client, long chatId,
-            Path downloadDirectory, int maxMessages) throws Exception {
+    /** Lists message metadata only; media is fetched when the player requests a specific video. */
+    static List<VideoReference> listVideos(SimpleTelegramClient client, long chatId, int maxMessages)
+            throws Exception {
         List<VideoReference> references = findVideos(client, chatId, maxMessages);
         if (references.isEmpty()) {
             throw new IllegalStateException("No video posts were found in the channel history.");
         }
-        Files.createDirectories(downloadDirectory);
-        Map<Integer, Path> downloadedFiles = new HashMap<>();
-        List<DownloadedVideo> videos = new ArrayList<>(references.size());
-        for (int i = 0; i < references.size(); i++) {
-            VideoReference reference = references.get(i);
-            System.out.printf("Downloading video %d of %d.%n", i + 1, references.size());
-            Path path = downloadedFiles.get(reference.file().id);
-            if (path == null) {
-                TdApi.File downloaded = client.send(new TdApi.DownloadFile(
-                                reference.file().id, 32, 0, 0, true))
-                        .get(DOWNLOAD_TIMEOUT.toMinutes(), TimeUnit.MINUTES);
-                if (downloaded.local == null || !downloaded.local.isDownloadingCompleted
-                        || downloaded.local.path == null || downloaded.local.path.isBlank()) {
-                    throw new IllegalStateException("Telegram did not complete the download for message "
-                            + reference.messageId() + ".");
-                }
-                path = Path.of(downloaded.local.path).toAbsolutePath().normalize();
-                if (!Files.isRegularFile(path) || Files.size(path) == 0) {
-                    throw new IllegalStateException("The downloaded media file for message "
-                            + reference.messageId() + " is missing or empty.");
-                }
-                downloadedFiles.put(reference.file().id, path);
-            }
-            videos.add(new DownloadedVideo(reference.messageId(), path));
+        return List.copyOf(references);
+    }
+
+    /** Downloads just the requested video through TDLib and returns its completed local file. */
+    static Path fetch(SimpleTelegramClient client, int fileId, long messageId) throws Exception {
+        TdApi.File downloaded = client.send(new TdApi.DownloadFile(fileId, 32, 0, 0, true))
+                .get(DOWNLOAD_TIMEOUT.toMinutes(), TimeUnit.MINUTES);
+        if (downloaded.local == null || !downloaded.local.isDownloadingCompleted
+                || downloaded.local.path == null || downloaded.local.path.isBlank()) {
+            throw new IllegalStateException("Telegram did not complete the download for message "
+                    + messageId + ".");
         }
-        return List.copyOf(videos);
+        Path path = Path.of(downloaded.local.path).toAbsolutePath().normalize();
+        if (!Files.isRegularFile(path) || Files.size(path) == 0) {
+            throw new IllegalStateException("The downloaded media file for message "
+                    + messageId + " is missing or empty.");
+        }
+        return path;
     }
 
     private static List<VideoReference> findVideos(SimpleTelegramClient client, long chatId, int maxMessages)
@@ -132,6 +123,5 @@ final class TelegramChannelPlaylist {
         return null;
     }
 
-    record DownloadedVideo(long messageId, Path path) { }
-    private record VideoReference(long messageId, TdApi.File file) { }
+    record VideoReference(long messageId, TdApi.File file) { }
 }

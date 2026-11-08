@@ -18,7 +18,7 @@ import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 
-/** Serves the Mini App player, a JSON playlist, and normalized MP4s over HTTP behind HTTPS proxy. */
+/** Serves the player and fetches each Telegram video only when playback requests it. */
 final class WebPlaylistServer {
     private final String bindAddress;
     private final int port;
@@ -27,16 +27,18 @@ final class WebPlaylistServer {
     private final String channelTitle;
     private final Path tokenFile;
     private final String configuredToken;
+    private final VideoFetcher videoFetcher;
 
     WebPlaylistServer(String bindAddress, int port, Path videoDirectory, List<Video> videos,
-            String channelTitle, Path tokenFile, String configuredToken) {
+            String channelTitle, Path tokenFile, String configuredToken, VideoFetcher videoFetcher) {
         this.bindAddress = bindAddress;
         this.port = port;
         this.videoDirectory = videoDirectory.toAbsolutePath().normalize();
-        this.videos = videos;
+        this.videos = List.copyOf(videos);
         this.channelTitle = channelTitle;
         this.tokenFile = tokenFile;
         this.configuredToken = configuredToken;
+        this.videoFetcher = videoFetcher;
     }
 
     void start() throws Exception {
@@ -48,6 +50,7 @@ final class WebPlaylistServer {
         System.out.println("\nPlaylist server is ready.");
         System.out.println("Open this private player URL in your browser or configure it as your Telegram Mini App:");
         System.out.printf("http://localhost:%d/?token=%s%n", port, token);
+        System.out.println("Videos are fetched and prepared only when selected for playback.");
         System.out.println("For public Mini App use, put this server behind HTTPS (see Caddy instructions in README).");
         new CountDownLatch(1).await();
     }
@@ -128,12 +131,17 @@ final class WebPlaylistServer {
         exchange.getResponseBody().write(bytes);
     }
 
-    private void serveVideo(HttpExchange exchange, String fileName) throws IOException {
+    private void serveVideo(HttpExchange exchange, String fileName) throws Exception {
         if (!fileName.matches("video-[0-9]{6}\\.mp4") || !exchange.getRequestMethod().equals("GET")) {
             sendText(exchange, 404, "Video not found.");
             return;
         }
-        Path file = videoDirectory.resolve(fileName).normalize();
+        Video video = videos.stream().filter(item -> item.fileName().equals(fileName)).findFirst().orElse(null);
+        if (video == null) {
+            sendText(exchange, 404, "Video not found.");
+            return;
+        }
+        Path file = videoFetcher.fetch(video).toAbsolutePath().normalize();
         if (!file.startsWith(videoDirectory) || !Files.isRegularFile(file)) {
             sendText(exchange, 404, "Video not found.");
             return;
@@ -225,5 +233,10 @@ final class WebPlaylistServer {
         exchange.getResponseBody().write(body);
     }
 
-    record Video(String fileName, String title) { }
+    @FunctionalInterface
+    interface VideoFetcher {
+        Path fetch(Video video) throws Exception;
+    }
+
+    record Video(String fileName, String title, int fileId, long messageId) { }
 }
