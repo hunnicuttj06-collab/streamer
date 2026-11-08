@@ -2,6 +2,10 @@ package com.teleroom.broadcaster;
 
 import it.tdlight.client.APIToken;
 
+import java.io.BufferedReader;
+import java.io.Console;
+import java.io.InputStreamReader;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 
 final class BroadcasterConfig {
@@ -29,18 +33,19 @@ final class BroadcasterConfig {
         this.accessToken = accessToken;
     }
 
-    static BroadcasterConfig fromEnvironment() {
-        int apiId;
-        try {
-            apiId = Integer.parseInt(required("TELEGRAM_API_ID"));
-        } catch (NumberFormatException exception) {
-            throw new IllegalArgumentException("TELEGRAM_API_ID must be an integer.", exception);
-        }
-        if (apiId <= 0) throw new IllegalArgumentException("TELEGRAM_API_ID must be positive.");
+    static BroadcasterConfig fromEnvironment() throws Exception {
+        int apiId = readApiId();
+        String apiHash = requiredOrPrompt("TELEGRAM_API_HASH",
+                "Step 2 of 3 - Enter your Telegram API hash from my.telegram.org:", true);
         String channel = optional("TELEGRAM_CHANNEL");
-        if (channel == null) channel = required("TELEGRAM_CHANNEL_ID");
+        if (channel == null) channel = optional("TELEGRAM_CHANNEL_ID");
+        if (channel == null) {
+            channel = requiredOrPrompt("TELEGRAM_CHANNEL",
+                    "Step 3 of 3 - Enter your channel ID, public link, invite link, username, or exact chat title:", false);
+        }
+
         return new BroadcasterConfig(
-                new APIToken(apiId, required("TELEGRAM_API_HASH")),
+                new APIToken(apiId, apiHash),
                 channel,
                 valueOrDefault("FFMPEG_PATH", "ffmpeg"),
                 valueOrDefault("FFPROBE_PATH", "ffprobe"),
@@ -52,10 +57,51 @@ final class BroadcasterConfig {
                 optional("PLAYER_ACCESS_TOKEN"));
     }
 
-    private static String required(String name) {
+    private static int readApiId() throws Exception {
+        String configured = optional("TELEGRAM_API_ID");
+        while (true) {
+            String value = configured;
+            if (value == null) {
+                value = prompt("Step 1 of 3 - Enter your Telegram API ID from my.telegram.org:", false);
+            }
+            try {
+                int parsed = Integer.parseInt(value.trim());
+                if (parsed > 0) return parsed;
+            } catch (NumberFormatException ignored) {
+                // Re-prompt below with a simple explanation.
+            }
+            System.out.println("The API ID must be a positive whole number. Please try again.");
+            configured = null;
+        }
+    }
+
+    private static String requiredOrPrompt(String name, String message, boolean secret) throws Exception {
         String value = optional(name);
-        if (value == null) throw new IllegalArgumentException("Set the required environment variable " + name + ".");
+        if (value == null) value = prompt(message, secret);
         return value;
+    }
+
+    private static String prompt(String message, boolean secret) throws Exception {
+        Console console = System.console();
+        while (true) {
+            String answer;
+            if (console != null && secret) {
+                char[] chars = console.readPassword("%s ", message);
+                answer = chars == null ? "" : new String(chars).trim();
+                if (chars != null) java.util.Arrays.fill(chars, '\0');
+            } else if (console != null) {
+                answer = console.readLine("%s ", message);
+                answer = answer == null ? "" : answer.trim();
+            } else {
+                System.out.println(message);
+                if (secret) System.out.println("Note: input cannot be hidden in this terminal.");
+                answer = new BufferedReader(new InputStreamReader(System.in, StandardCharsets.UTF_8))
+                        .readLine();
+                answer = answer == null ? "" : answer.trim();
+            }
+            if (!answer.isBlank()) return answer;
+            System.out.println("This value is required. Please try again.");
+        }
     }
 
     private static String optional(String name) {

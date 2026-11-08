@@ -19,6 +19,7 @@ public final class TelegramVideoBroadcaster {
     private TelegramVideoBroadcaster() { }
 
     public static void main(String[] args) throws Exception {
+        System.out.println("Welcome. The app will request any missing setup information one item at a time.");
         BroadcasterConfig config = BroadcasterConfig.fromEnvironment();
         Files.createDirectories(config.dataDirectory);
         MediaPipeline pipeline = new MediaPipeline(config.ffmpeg, config.ffprobe,
@@ -40,6 +41,8 @@ public final class TelegramVideoBroadcaster {
             SimpleTelegramClient client = factory.builder(settings)
                     .build(AuthenticationSupplier.consoleLogin());
             try (client) {
+                System.out.println("Telegram sign-in: follow the next prompts for your phone number, login code, "
+                        + "and two-step password if requested. These are handled by TDLib.");
                 client.getMeAsync().get(TELEGRAM_TIMEOUT.toMinutes(), TimeUnit.MINUTES);
                 TdApi.Chat channel = TelegramChannelResolver.resolve(
                         client, config.channelSelector, TELEGRAM_TIMEOUT);
