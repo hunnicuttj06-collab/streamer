@@ -27,10 +27,12 @@ final class WebPlaylistServer {
     private final String channelTitle;
     private final Path tokenFile;
     private final String configuredToken;
+        private final String publicBaseUrl;
     private final VideoFetcher videoFetcher;
 
     WebPlaylistServer(String bindAddress, int port, Path videoDirectory, List<Video> videos,
-            String channelTitle, Path tokenFile, String configuredToken, VideoFetcher videoFetcher) {
+            String channelTitle, Path tokenFile, String configuredToken, String publicBaseUrl,
+            VideoFetcher videoFetcher) {
         this.bindAddress = bindAddress;
         this.port = port;
         this.videoDirectory = videoDirectory.toAbsolutePath().normalize();
@@ -38,6 +40,7 @@ final class WebPlaylistServer {
         this.channelTitle = channelTitle;
         this.tokenFile = tokenFile;
         this.configuredToken = configuredToken;
+        this.publicBaseUrl = publicBaseUrl;
         this.videoFetcher = videoFetcher;
     }
 
@@ -47,11 +50,20 @@ final class WebPlaylistServer {
         server.createContext("/", exchange -> handle(exchange, token));
         server.setExecutor(Executors.newCachedThreadPool());
         server.start();
+        String baseUrl = resolvedBaseUrl();
         System.out.println("\nPlaylist server is ready.");
-        System.out.println("Open this private player URL in your browser or configure it as your Telegram Mini App:");
-        System.out.printf("http://localhost:%d/?token=%s%n", port, token);
-        System.out.println("Videos are fetched and prepared only when selected for playback.");
-        System.out.println("For public Mini App use, put this server behind HTTPS (see Caddy instructions in README).");
+        System.out.println("Private browser player URL:");
+        System.out.printf("%s/?token=%s%n", baseUrl, queryEncode(token));
+        System.out.println("Media-player playlist URL (M3U, e.g. VLC/MPV):");
+        System.out.printf("%s/playlist.m3u?token=%s%n", baseUrl, queryEncode(token));
+        System.out.println("Direct MP4 URL pattern: video links use /videos/video-NNNNNN.mp4?token=...");
+        System.out.println("Selected streamable MP4s play while downloading; other videos are prepared on demand.");
+        if (publicBaseUrl == null) {
+            System.out.println("These localhost URLs work only on this computer. Set PLAYER_PUBLIC_BASE_URL "
+                    + "to a reachable LAN address or HTTPS domain for sharing.");
+        } else {
+            System.out.println("Keep these tokenized URLs private; anyone with one can access the channel playlist.");
+        }
         new CountDownLatch(1).await();
     }
 
@@ -78,9 +90,12 @@ final class WebPlaylistServer {
                 servePlayer(exchange);
             } else if (path.equals("/api/playlist") && authorized(exchange, token)) {
                 servePlaylist(exchange);
+            } else if (path.equals("/playlist.m3u") && authorized(exchange, token)) {
+                serveMediaPlaylist(exchange, token);
             } else if (path.startsWith("/videos/") && authorized(exchange, token)) {
                 serveVideo(exchange, path.substring("/videos/".length()));
-            } else if (path.equals("/api/playlist") || path.startsWith("/videos/")) {
+            } else if (path.equals("/api/playlist") || path.equals("/playlist.m3u")
+                    || path.startsWith("/videos/")) {
                 sendText(exchange, 403, "Access denied. Open the private player link.");
             } else {
                 sendText(exchange, 404, "Not found.");
@@ -131,6 +146,33 @@ final class WebPlaylistServer {
         exchange.getResponseBody().write(bytes);
     }
 
+    private void serveMediaPlaylist(HttpExchange exchange, String token) throws IOException {
+        if (!exchange.getRequestMethod().equals("GET")) {
+            sendText(exchange, 405, "Method not allowed.");
+            return;
+        }
+        byte[] bytes = mediaPlaylistM3u(resolvedBaseUrl(), videos, token).getBytes(StandardCharsets.UTF_8);
+        exchange.getResponseHeaders().set("Content-Type", "audio/x-mpegurl; charset=utf-8");
+        exchange.getResponseHeaders().set("Cache-Control", "private, no-store");
+        exchange.sendResponseHeaders(200, bytes.length);
+        exchange.getResponseBody().write(bytes);
+    }
+
+    private String resolvedBaseUrl() {
+        return publicBaseUrl != null ? publicBaseUrl : "http://localhost:" + port;
+    }
+
+    static String mediaPlaylistM3u(String baseUrl, List<Video> videos, String token) {
+        StringBuilder playlist = new StringBuilder("#EXTM3U\n");
+        for (Video video : videos) {
+            String title = video.title().replace('\r', ' ').replace('\n', ' ');
+            playlist.append("#EXTINF:-1,").append(title).append('\n')
+                    .append(baseUrl).append("/videos/").append(video.fileName())
+                    .append("?token=").append(queryEncode(token)).append('\n');
+        }
+        return playlist.toString();
+    }
+
     private void serveVideo(HttpExchange exchange, String fileName) throws Exception {
         if (!fileName.matches("video-[0-9]{6}\\.mp4") || !exchange.getRequestMethod().equals("GET")) {
             sendText(exchange, 404, "Video not found.");
@@ -141,12 +183,12 @@ final class WebPlaylistServer {
             sendText(exchange, 404, "Video not found.");
             return;
         }
-        Path file = videoFetcher.fetch(video).toAbsolutePath().normalize();
-        if (!file.startsWith(videoDirectory) || !Files.isRegularFile(file)) {
+        VideoSource source = videoFetcher.fetch(video);
+        if (source instanceof FileVideoSource fileSource && !fileSource.path().startsWith(videoDirectory)) {
             sendText(exchange, 404, "Video not found.");
             return;
         }
-        long size = Files.size(file);
+        long size = source.size();
         long start = 0;
         long end = size - 1;
         int status = 200;
@@ -168,9 +210,9 @@ final class WebPlaylistServer {
         headers.set("Cache-Control", "private, no-store");
         if (status == 206) headers.set("Content-Range", "bytes " + start + "-" + end + "/" + size);
         long length = end - start + 1;
+        InputStream input = source.openRange(start, length);
         exchange.sendResponseHeaders(status, length);
-        try (InputStream input = Files.newInputStream(file)) {
-            input.skipNBytes(start);
+        try (input) {
             byte[] buffer = new byte[64 * 1024];
             long remaining = length;
             while (remaining > 0) {
@@ -235,8 +277,72 @@ final class WebPlaylistServer {
 
     @FunctionalInterface
     interface VideoFetcher {
-        Path fetch(Video video) throws Exception;
+        VideoSource fetch(Video video) throws Exception;
     }
 
-    record Video(String fileName, String title, int fileId, long messageId) { }
+    interface VideoSource {
+        long size() throws IOException;
+
+        InputStream openRange(long start, long length) throws IOException;
+    }
+
+    static VideoSource fileSource(Path path, Path allowedDirectory) throws IOException {
+        Path root = allowedDirectory.toAbsolutePath().normalize();
+        Path file = path.toAbsolutePath().normalize();
+        if (!file.startsWith(root) || !Files.isRegularFile(file)) {
+            throw new IOException("Video file is not available in the configured media directory.");
+        }
+        return new FileVideoSource(file, Files.size(file));
+    }
+
+    private record FileVideoSource(Path path, long size) implements VideoSource {
+        @Override
+        public InputStream openRange(long start, long length) throws IOException {
+            if (start < 0 || length < 0 || start + length > size) {
+                throw new IOException("Requested video range is outside the file.");
+            }
+            InputStream input = Files.newInputStream(path);
+            try {
+                input.skipNBytes(start);
+                return new LimitedInputStream(input, length);
+            } catch (IOException exception) {
+                input.close();
+                throw exception;
+            }
+        }
+    }
+
+    private static final class LimitedInputStream extends InputStream {
+        private final InputStream input;
+        private long remaining;
+
+        private LimitedInputStream(InputStream input, long remaining) {
+            this.input = input;
+            this.remaining = remaining;
+        }
+
+        @Override
+        public int read() throws IOException {
+            if (remaining == 0) return -1;
+            int value = input.read();
+            if (value >= 0) remaining--;
+            return value;
+        }
+
+        @Override
+        public int read(byte[] bytes, int offset, int length) throws IOException {
+            if (remaining == 0) return -1;
+            int read = input.read(bytes, offset, (int) Math.min(length, remaining));
+            if (read > 0) remaining -= read;
+            return read;
+        }
+
+        @Override
+        public void close() throws IOException {
+            input.close();
+        }
+    }
+
+    record Video(String fileName, String title, int fileId, long messageId,
+            boolean progressivelyStreamable) { }
 }

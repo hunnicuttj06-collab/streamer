@@ -1,12 +1,14 @@
 package com.teleroom.broadcaster;
 
 import it.tdlight.client.SimpleTelegramClient;
+import it.tdlight.client.TelegramError;
 import it.tdlight.jni.TdApi;
 
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 
 /** Resolves a channel identifier supplied as an ID, Telegram link, username, or known chat title. */
@@ -27,12 +29,26 @@ final class TelegramChannelResolver {
 
         String link = normalizedTelegramLink(value);
         if (isInviteLink(link)) {
-            // JoinChatByInviteLink returns a ChatJoinResult subtype, not a chatId field.
-            // Only the Chat subtype directly contains the resolved chat.
-            TdApi.ChatJoinResult result = client.send(new TdApi.JoinChatByInviteLink(link))
-                    .get(timeout.toMinutes(), TimeUnit.MINUTES);
-            if (result instanceof TdApi.ChatJoinResult.Chat joined && joined.chat != null) {
-                return joined.chat;
+            Object result;
+            try {
+                result = client.send(new TdApi.JoinChatByInviteLink(link))
+                        .get(timeout.toMinutes(), TimeUnit.MINUTES);
+            } catch (ExecutionException exception) {
+                if (!isAlreadyParticipant(exception.getCause())) throw exception;
+                TdApi.ChatInviteLinkInfo inviteInfo = client.send(new TdApi.CheckChatInviteLink(link))
+                        .get(timeout.toMinutes(), TimeUnit.MINUTES);
+                if (inviteInfo.chatId == 0) {
+                    throw new IllegalStateException("Telegram reports that this account already joined, "
+                            + "but did not return the channel ID for the invite link.");
+                }
+                if (!client.isMainChatsListLoaded()) {
+                    client.loadChatListMainAsync().get(timeout.toMinutes(), TimeUnit.MINUTES);
+                }
+                return getChat(client, inviteInfo.chatId, timeout);
+            }
+            TdApi.Chat joinedChat = extractChatFromJoinResult(result);
+            if (joinedChat != null) {
+                return joinedChat;
             }
             throw new IllegalStateException("Telegram did not return a chat for this invite link. "
                     + "If you already joined the channel, use its chat ID, public link, or exact title.");
@@ -99,6 +115,27 @@ final class TelegramChannelResolver {
     private static boolean isInviteLink(String value) {
         String lower = value.toLowerCase(Locale.ROOT);
         return lower.startsWith("https://t.me/+") || lower.startsWith("https://t.me/joinchat/");
+    }
+
+    private static TdApi.Chat extractChatFromJoinResult(Object result) {
+        if (result instanceof TdApi.Chat chat) {
+            return chat;
+        }
+        if (result instanceof TdApi.Error error) {
+            throw new IllegalStateException("Telegram rejected the invite link: " + error.message, new RuntimeException(error.message));
+        }
+        return null;
+    }
+
+    private static boolean isAlreadyParticipant(Throwable error) {
+        while (error != null) {
+            if (error instanceof TelegramError telegramError
+                    && "USER_ALREADY_PARTICIPANT".equals(telegramError.getErrorMessage())) {
+                return true;
+            }
+            error = error.getCause();
+        }
+        return false;
     }
 
     private static String usernameFromLink(String value) {

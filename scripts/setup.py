@@ -73,7 +73,13 @@ def refresh_windows_path():
 
 
 def local_app_data():
-    return Path(os.environ.get("LOCALAPPDATA", Path.home()))
+    fallback = Path.home() / ".local"
+    if platform.system() == "Windows":
+        os.environ["LOCALAPPDATA"] = str(fallback)
+        return fallback
+    value = Path(os.environ.get("LOCALAPPDATA") or fallback)
+    os.environ["LOCALAPPDATA"] = str(value)
+    return value
 
 
 def candidate_executables(tool):
@@ -213,17 +219,24 @@ def find_maven_windows():
     seen = set()
     for home in homes:
         try:
-            home = home.expanduser().resolve()
-        except OSError:
+            home = home.expanduser()
+            normalized = str(home).lower()
+            if "\\packages\\" in normalized or "\\localcache\\local" in normalized:
+                continue
+            home = home.absolute()
+        except (OSError, RuntimeError):
             continue
-        if home in seen:
+        if str(home) in seen:
             continue
-        seen.add(home)
+        seen.add(str(home))
         for name in ("mvn.cmd", "mvn.bat", "mvn.exe"):
             executable = home / "bin" / name
-            if executable.is_file():
-                prepend_path(executable.parent)
-                return str(executable)
+            try:
+                if executable.is_file():
+                    prepend_path(executable.parent)
+                    return str(executable)
+            except (OSError, PermissionError):
+                continue
     return None
 
 
@@ -336,11 +349,9 @@ def install_dependencies():
 def launch(maven, project_root):
     args = ["-B", "compile", "exec:java"]
     if platform.system() == "Windows" and Path(maven).suffix.lower() in (".cmd", ".bat"):
-        # Start cmd with a command string that begins with CALL. Avoid /s and nested
-        # quoting, which can make cmd.exe treat the quoted Maven path as a literal token.
-        command = f'call "{maven}" ' + " ".join(args)
-        return subprocess.call([os.environ.get("COMSPEC", "cmd.exe"), "/d", "/c", command],
-                               cwd=project_root)
+        # install_maven_windows() ensures the executable's directory is on PATH.
+        # Resolve it by name so cmd doesn't re-escape the quoted full path.
+        return subprocess.call("mvn " + " ".join(args), shell=True, cwd=project_root)
     return subprocess.call([maven, *args], cwd=project_root)
 
 

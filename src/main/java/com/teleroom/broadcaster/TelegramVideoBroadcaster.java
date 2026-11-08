@@ -12,6 +12,7 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 
 public final class TelegramVideoBroadcaster {
@@ -25,7 +26,6 @@ public final class TelegramVideoBroadcaster {
         Files.createDirectories(config.dataDirectory);
         MediaPipeline pipeline = new MediaPipeline(config.ffmpeg, config.ffprobe,
                 new MediaPipeline.ProcessRunner());
-        pipeline.verifyTools();
 
         Init.init();
         Path sessionDirectory = config.dataDirectory.resolve("tdlib-session");
@@ -39,12 +39,25 @@ public final class TelegramVideoBroadcaster {
         settings.setDownloadedFilesDirectoryPath(downloadDirectory);
 
         try (SimpleTelegramClientFactory factory = new SimpleTelegramClientFactory()) {
-            SimpleTelegramClient client = factory.builder(settings)
-                    .build(AuthenticationSupplier.consoleLogin());
+            TelegramLoginInteraction loginInteraction = new TelegramLoginInteraction();
+            var clientBuilder = factory.builder(settings);
+            clientBuilder.setClientInteraction(loginInteraction);
+                SimpleTelegramClient client = clientBuilder.build(
+                    new TelegramPhoneAuthenticationSupplier(config.phoneNumber));
             try (client) {
                 System.out.println("Telegram sign-in: follow the next prompts for your phone number, login code, "
                         + "and two-step password if requested. These are handled by TDLib.");
-                client.getMeAsync().get(TELEGRAM_TIMEOUT.toMinutes(), TimeUnit.MINUTES);
+            Object loginResult = CompletableFuture.anyOf(
+                client.getMeAsync(), loginInteraction.deviceApprovalRequired())
+                .get(TELEGRAM_TIMEOUT.toMinutes(), TimeUnit.MINUTES);
+            if (!(loginResult instanceof TdApi.User)) {
+                throw new IllegalStateException("Telegram requires approval on another signed-in device. "
+                    + "No login code was sent; approve the sign-in privately in Telegram, then restart.");
+            }
+                if (config.channelSelector.matches("-?\\d+")) {
+                    System.out.println("Loading the Telegram chat list before resolving the channel ID.");
+                    client.loadChatListMainAsync().get(TELEGRAM_TIMEOUT.toMinutes(), TimeUnit.MINUTES);
+                }
                 TdApi.Chat channel = TelegramChannelResolver.resolve(
                         client, config.channelSelector, TELEGRAM_TIMEOUT);
                 if (!(channel.type instanceof TdApi.ChatTypeSupergroup type) || !type.isChannel) {
@@ -58,17 +71,26 @@ public final class TelegramVideoBroadcaster {
                     var reference = references.get(i);
                     playlist.add(new WebPlaylistServer.Video(
                             String.format("video-%06d.mp4", i + 1), "Video " + (i + 1),
-                            reference.file().id, reference.messageId()));
+                            reference.file().id, reference.messageId(), reference.progressivelyStreamable()));
                 }
+                if (playlist.stream().anyMatch(video -> !video.progressivelyStreamable())) {
+                    pipeline.verifyTools();
+                }
+                ProgressiveTelegramDownload progressiveDownload =
+                        new ProgressiveTelegramDownload(client, downloadDirectory);
                 WebPlaylistServer.VideoFetcher fetcher = video -> {
+                    if (video.progressivelyStreamable()) {
+                        return progressiveDownload.open(video.fileId());
+                    }
                     Path downloaded = TelegramChannelPlaylist.fetch(client, video.fileId(), video.messageId());
                     Path output = publicVideos.resolve(video.fileName());
                     pipeline.prepareVideo(downloaded, output, video.messageId());
-                    return output;
+                    return WebPlaylistServer.fileSource(output, publicVideos);
                 };
                 WebPlaylistServer server = new WebPlaylistServer(
                         config.bindAddress, config.port, publicVideos, playlist, channel.title,
-                        config.dataDirectory.resolve("player-token.txt"), config.accessToken, fetcher);
+                    config.dataDirectory.resolve("player-token.txt"), config.accessToken,
+                    config.publicBaseUrl, fetcher);
                 server.start();
             }
         }

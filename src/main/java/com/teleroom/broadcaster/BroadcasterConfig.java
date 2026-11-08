@@ -1,35 +1,38 @@
 package com.teleroom.broadcaster;
 
 import it.tdlight.client.APIToken;
+import it.tdlight.util.ScannerUtils;
 
-import java.io.BufferedReader;
 import java.io.Console;
-import java.io.InputStreamReader;
-import java.nio.charset.StandardCharsets;
+import java.net.URI;
 import java.nio.file.Path;
 
 final class BroadcasterConfig {
     final APIToken apiToken;
     final String channelSelector;
+    final String phoneNumber;
     final String ffmpeg;
     final String ffprobe;
     final Path dataDirectory;
     final int maxMessages;
     final String bindAddress;
     final int port;
+    final String publicBaseUrl;
     final String accessToken;
 
-    private BroadcasterConfig(APIToken apiToken, String channelSelector, String ffmpeg,
+    private BroadcasterConfig(APIToken apiToken, String channelSelector, String phoneNumber, String ffmpeg,
             String ffprobe, Path dataDirectory, int maxMessages, String bindAddress,
-            int port, String accessToken) {
+            int port, String publicBaseUrl, String accessToken) {
         this.apiToken = apiToken;
         this.channelSelector = channelSelector;
+        this.phoneNumber = phoneNumber;
         this.ffmpeg = ffmpeg;
         this.ffprobe = ffprobe;
         this.dataDirectory = dataDirectory;
         this.maxMessages = maxMessages;
         this.bindAddress = bindAddress;
         this.port = port;
+        this.publicBaseUrl = publicBaseUrl;
         this.accessToken = accessToken;
     }
 
@@ -47,6 +50,7 @@ final class BroadcasterConfig {
         return new BroadcasterConfig(
                 new APIToken(apiId, apiHash),
                 channel,
+                optional("TELEGRAM_PHONE_NUMBER"),
                 valueOrDefault("FFMPEG_PATH", "ffmpeg"),
                 valueOrDefault("FFPROBE_PATH", "ffprobe"),
                 Path.of(valueOrDefault("APP_DATA_DIR", defaultDataDirectory().toString()))
@@ -54,7 +58,26 @@ final class BroadcasterConfig {
                 positiveInteger("TELEGRAM_MAX_MESSAGES", 100_000),
                 valueOrDefault("PLAYER_BIND_ADDRESS", "0.0.0.0"),
                 positiveInteger("PLAYER_PORT", 8080),
+                validatePublicBaseUrl(optional("PLAYER_PUBLIC_BASE_URL")),
                 optional("PLAYER_ACCESS_TOKEN"));
+    }
+
+    static String validatePublicBaseUrl(String value) {
+        if (value == null || value.isBlank()) return null;
+        String normalized = value.trim().replaceAll("/+$", "");
+        try {
+            URI uri = URI.create(normalized);
+            if (!("http".equalsIgnoreCase(uri.getScheme()) || "https".equalsIgnoreCase(uri.getScheme()))
+                    || uri.getHost() == null || uri.getRawUserInfo() != null
+                    || uri.getRawQuery() != null || uri.getRawFragment() != null
+                    || (uri.getPath() != null && !uri.getPath().isEmpty() && !"/".equals(uri.getPath()))) {
+                throw new IllegalArgumentException();
+            }
+        } catch (IllegalArgumentException exception) {
+            throw new IllegalArgumentException("PLAYER_PUBLIC_BASE_URL must be an http(s) origin, "
+                    + "for example https://player.example.com.", exception);
+        }
+        return normalized;
     }
 
     private static int readApiId() throws Exception {
@@ -93,10 +116,8 @@ final class BroadcasterConfig {
                 answer = console.readLine("%s ", message);
                 answer = answer == null ? "" : answer.trim();
             } else {
-                System.out.println(message);
                 if (secret) System.out.println("Note: input cannot be hidden in this terminal.");
-                answer = new BufferedReader(new InputStreamReader(System.in, StandardCharsets.UTF_8))
-                        .readLine();
+                answer = ScannerUtils.askParameter("setup", message);
                 answer = answer == null ? "" : answer.trim();
             }
             if (!answer.isBlank()) return answer;

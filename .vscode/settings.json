@@ -1,0 +1,6 @@
+{
+    "java.configuration.updateBuildConfiguration": "automatic",
+    "terminal.integrated.env.windows": {
+        "PATH": "C:\\Users\\KOKag\\.maven\\maven-3.10.0\\bin;${env:PATH}"
+    }
+}

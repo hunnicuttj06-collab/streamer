@@ -74,7 +74,9 @@ final class TelegramChannelPlaylist {
                 if (!seenMessageIds.add(message.id)) continue;
                 newMessages++;
                 TdApi.File file = videoFile(message.content);
-                if (file != null) videos.add(new VideoReference(message.id, file));
+                if (file != null) {
+                    videos.add(new VideoReference(message.id, file, isProgressivelyStreamable(message.content)));
+                }
             }
             if (newMessages == 0) {
                 if (hasOlderMessages(client, chatId, fromMessageId)) {
@@ -123,5 +125,10 @@ final class TelegramChannelPlaylist {
         return null;
     }
 
-    record VideoReference(long messageId, TdApi.File file) { }
+    private static boolean isProgressivelyStreamable(TdApi.MessageContent content) {
+        if (!(content instanceof TdApi.MessageVideo video) || video.video == null) return false;
+        return video.video.supportsStreaming && "video/mp4".equalsIgnoreCase(video.video.mimeType);
+    }
+
+    record VideoReference(long messageId, TdApi.File file, boolean progressivelyStreamable) { }
 }
