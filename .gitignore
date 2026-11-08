@@ -1,0 +1,6 @@
+target/
+.tools/
+.state/
+.data/
+.env
+*.log

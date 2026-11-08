@@ -1,0 +1,84 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <groupId>com.teleroom</groupId>
+    <artifactId>telegram-video-broadcaster</artifactId>
+    <version>1.0.0</version>
+
+    <properties>
+        <maven.compiler.release>17</maven.compiler.release>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <tdlight.version>3.5.9+td.1.8.68</tdlight.version>
+        <tdlight.native.classifier>windows_amd64</tdlight.native.classifier>
+    </properties>
+
+    <repositories>
+        <repository>
+            <id>mchv</id>
+            <url>https://mvn.mchv.eu/repository/mchv/</url>
+        </repository>
+    </repositories>
+
+    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>it.tdlight</groupId>
+                <artifactId>tdlight-java-bom</artifactId>
+                <version>${tdlight.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
+    <dependencies>
+        <dependency>
+            <groupId>it.tdlight</groupId>
+            <artifactId>tdlight-java</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>it.tdlight</groupId>
+            <artifactId>tdlight-natives</artifactId>
+            <classifier>${tdlight.native.classifier}</classifier>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.14.0</version>
+                <configuration><release>17</release></configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.codehaus.mojo</groupId>
+                <artifactId>exec-maven-plugin</artifactId>
+                <version>3.5.0</version>
+                <configuration>
+                    <mainClass>com.teleroom.broadcaster.TelegramVideoBroadcaster</mainClass>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+
+    <profiles>
+        <profile>
+            <id>tdlight-linux-amd64</id>
+            <activation><os><family>unix</family><arch>amd64</arch><name>Linux</name></os></activation>
+            <properties><tdlight.native.classifier>linux_amd64_gnu_ssl3</tdlight.native.classifier></properties>
+        </profile>
+        <profile>
+            <id>tdlight-macos-amd64</id>
+            <activation><os><family>mac</family><arch>x86_64</arch></os></activation>
+            <properties><tdlight.native.classifier>macos_amd64</tdlight.native.classifier></properties>
+        </profile>
+        <profile>
+            <id>tdlight-macos-arm64</id>
+            <activation><os><family>mac</family><arch>aarch64</arch></os></activation>
+            <properties><tdlight.native.classifier>macos_arm64</tdlight.native.classifier></properties>
+        </profile>
+    </profiles>
+</project>
