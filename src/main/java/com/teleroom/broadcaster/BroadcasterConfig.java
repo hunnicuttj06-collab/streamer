@@ -2,30 +2,31 @@ package com.teleroom.broadcaster;
 
 import it.tdlight.client.APIToken;
 
-import java.net.URI;
 import java.nio.file.Path;
 
 final class BroadcasterConfig {
-    private static final String DEFAULT_RTMP_BASE_URL = "rtmps://dc1-1.rtmp.t.me/s/";
     final APIToken apiToken;
     final String channelSelector;
-    final String streamUrl;
-    final String streamKey;
     final String ffmpeg;
     final String ffprobe;
     final Path dataDirectory;
     final int maxMessages;
+    final String bindAddress;
+    final int port;
+    final String accessToken;
 
-    private BroadcasterConfig(APIToken apiToken, String channelSelector, String streamUrl, String streamKey,
-            String ffmpeg, String ffprobe, Path dataDirectory, int maxMessages) {
+    private BroadcasterConfig(APIToken apiToken, String channelSelector, String ffmpeg,
+            String ffprobe, Path dataDirectory, int maxMessages, String bindAddress,
+            int port, String accessToken) {
         this.apiToken = apiToken;
         this.channelSelector = channelSelector;
-        this.streamUrl = streamUrl;
-        this.streamKey = streamKey;
         this.ffmpeg = ffmpeg;
         this.ffprobe = ffprobe;
         this.dataDirectory = dataDirectory;
         this.maxMessages = maxMessages;
+        this.bindAddress = bindAddress;
+        this.port = port;
+        this.accessToken = accessToken;
     }
 
     static BroadcasterConfig fromEnvironment() {
@@ -36,31 +37,19 @@ final class BroadcasterConfig {
             throw new IllegalArgumentException("TELEGRAM_API_ID must be an integer.", exception);
         }
         if (apiId <= 0) throw new IllegalArgumentException("TELEGRAM_API_ID must be positive.");
-        String apiHash = required("TELEGRAM_API_HASH");
-        String channelSelector = optional("TELEGRAM_CHANNEL");
-        if (channelSelector == null) channelSelector = required("TELEGRAM_CHANNEL_ID");
-        String streamKey = required("TELEGRAM_STREAM_KEY");
-        if (!streamKey.matches("[A-Za-z0-9._:-]+")) {
-            throw new IllegalArgumentException("TELEGRAM_STREAM_KEY contains unsupported characters; "
-                    + "provide the key only, not a URL.");
-        }
-        String baseUrl = valueOrDefault("TELEGRAM_RTMP_BASE_URL", DEFAULT_RTMP_BASE_URL);
-        if (!baseUrl.startsWith("rtmps://") || !baseUrl.endsWith("/")) {
-            throw new IllegalArgumentException("TELEGRAM_RTMP_BASE_URL must be an RTMPS base URL ending in '/'.");
-        }
-        String streamUrl = baseUrl + streamKey;
-        URI uri;
-        try {
-            uri = URI.create(streamUrl);
-        } catch (IllegalArgumentException exception) {
-            throw new IllegalArgumentException("The RTMPS server URL or stream key is invalid.", exception);
-        }
-        if (uri.getHost() == null || uri.getRawQuery() != null || uri.getRawFragment() != null) {
-            throw new IllegalArgumentException("The RTMPS server URL or stream key is invalid.");
-        }
-        return new BroadcasterConfig(new APIToken(apiId, apiHash), channelSelector, streamUrl, streamKey,
-                valueOrDefault("FFMPEG_PATH", "ffmpeg"), valueOrDefault("FFPROBE_PATH", "ffprobe"),
-                defaultDataDirectory(), positiveInteger("TELEGRAM_MAX_MESSAGES", 100_000));
+        String channel = optional("TELEGRAM_CHANNEL");
+        if (channel == null) channel = required("TELEGRAM_CHANNEL_ID");
+        return new BroadcasterConfig(
+                new APIToken(apiId, required("TELEGRAM_API_HASH")),
+                channel,
+                valueOrDefault("FFMPEG_PATH", "ffmpeg"),
+                valueOrDefault("FFPROBE_PATH", "ffprobe"),
+                Path.of(valueOrDefault("APP_DATA_DIR", defaultDataDirectory().toString()))
+                        .toAbsolutePath().normalize(),
+                positiveInteger("TELEGRAM_MAX_MESSAGES", 100_000),
+                valueOrDefault("PLAYER_BIND_ADDRESS", "0.0.0.0"),
+                positiveInteger("PLAYER_PORT", 8080),
+                optional("PLAYER_ACCESS_TOKEN"));
     }
 
     private static String required(String name) {
@@ -74,14 +63,14 @@ final class BroadcasterConfig {
         return value == null || value.isBlank() ? null : value.trim();
     }
 
-    private static String valueOrDefault(String name, String defaultValue) {
+    private static String valueOrDefault(String name, String fallback) {
         String value = optional(name);
-        return value == null ? defaultValue : value;
+        return value == null ? fallback : value;
     }
 
-    private static int positiveInteger(String name, int defaultValue) {
+    private static int positiveInteger(String name, int fallback) {
         String value = optional(name);
-        if (value == null) return defaultValue;
+        if (value == null) return fallback;
         try {
             int parsed = Integer.parseInt(value);
             if (parsed <= 0) throw new IllegalArgumentException(name + " must be positive.");
@@ -96,6 +85,7 @@ final class BroadcasterConfig {
         if (localAppData != null && !localAppData.isBlank()) {
             return Path.of(localAppData, "Teleroom", "TelegramVideoBroadcaster");
         }
-        return Path.of(System.getProperty("user.home"), ".local", "share", "telegram-video-broadcaster");
+        return Path.of(System.getProperty("user.home"), ".local", "share",
+                "telegram-video-broadcaster");
     }
 }

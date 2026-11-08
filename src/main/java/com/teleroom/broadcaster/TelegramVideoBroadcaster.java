@@ -21,9 +21,9 @@ public final class TelegramVideoBroadcaster {
     public static void main(String[] args) throws Exception {
         BroadcasterConfig config = BroadcasterConfig.fromEnvironment();
         Files.createDirectories(config.dataDirectory);
-        MediaPipeline.ProcessRunner processRunner = new MediaPipeline.ProcessRunner();
-        MediaPipeline mediaPipeline = new MediaPipeline(config.ffmpeg, config.ffprobe, processRunner);
-        mediaPipeline.verifyTools();
+        MediaPipeline pipeline = new MediaPipeline(config.ffmpeg, config.ffprobe,
+                new MediaPipeline.ProcessRunner());
+        pipeline.verifyTools();
 
         Init.init();
         Path sessionDirectory = config.dataDirectory.resolve("tdlib-session");
@@ -34,6 +34,8 @@ public final class TelegramVideoBroadcaster {
         settings.setDatabaseDirectoryPath(sessionDirectory.resolve("database"));
         settings.setDownloadedFilesDirectoryPath(downloadDirectory);
 
+        List<TelegramChannelPlaylist.DownloadedVideo> videos;
+        String channelTitle;
         try (SimpleTelegramClientFactory factory = new SimpleTelegramClientFactory()) {
             SimpleTelegramClient client = factory.builder(settings)
                     .build(AuthenticationSupplier.consoleLogin());
@@ -41,17 +43,21 @@ public final class TelegramVideoBroadcaster {
                 client.getMeAsync().get(TELEGRAM_TIMEOUT.toMinutes(), TimeUnit.MINUTES);
                 TdApi.Chat channel = TelegramChannelResolver.resolve(
                         client, config.channelSelector, TELEGRAM_TIMEOUT);
-                if (!(channel.type instanceof TdApi.ChatTypeSupergroup supergroupType)
-                        || !supergroupType.isChannel) {
+                if (!(channel.type instanceof TdApi.ChatTypeSupergroup type) || !type.isChannel) {
                     throw new IllegalArgumentException("The selected chat is not a Telegram channel.");
                 }
-                System.out.printf("Reading video posts from channel '%s' (ID %d).%n",
-                        channel.title, channel.id);
-                List<TelegramChannelPlaylist.DownloadedVideo> videos = TelegramChannelPlaylist.download(
-                        client, channel.id, downloadDirectory, config.maxMessages);
-                Path playlist = mediaPipeline.prepare(videos, config.dataDirectory);
-                mediaPipeline.publish(playlist, config.streamUrl, config.streamKey);
+                channelTitle = channel.title;
+                System.out.printf("Loading videos from '%s' (ID %d).%n", channel.title, channel.id);
+                videos = TelegramChannelPlaylist.download(client, channel.id,
+                        downloadDirectory, config.maxMessages);
             }
         }
+
+        Path publicVideos = config.dataDirectory.resolve("web-videos");
+        List<WebPlaylistServer.Video> playlist = pipeline.prepareForWeb(videos, publicVideos);
+        WebPlaylistServer server = new WebPlaylistServer(
+                config.bindAddress, config.port, publicVideos, playlist, channelTitle,
+                config.dataDirectory.resolve("player-token.txt"), config.accessToken);
+        server.start();
     }
 }

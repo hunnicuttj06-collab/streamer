@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+  <meta name="theme-color" content="#10131b">
+  <title>Channel video playlist</title>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <style>
+    :root { color-scheme: dark; font-family: system-ui, sans-serif; background: #10131b; color: #f5f7fb; }
+    body { max-width: 900px; margin: auto; padding: 18px; }
+    h1 { font-size: 1.35rem; margin: 8px 0; }
+    #channel, #status { color: #aab4c5; }
+    video { display: block; width: 100%; max-height: 70vh; margin: 18px 0; background: #000; border-radius: 12px; }
+    .controls { display: flex; gap: 12px; align-items: center; }
+    button { font: inherit; border: 0; border-radius: 9px; padding: 11px 18px; background: #4b8cff; color: white; }
+    button:disabled { opacity: .45; }
+    #now { margin: 16px 0; }
+  </style>
+</head>
+<body>
+  <h1>Channel playlist</h1>
+  <div id="channel">Loading playlist…</div>
+  <video id="player" controls playsinline preload="metadata"></video>
+  <div id="now">Loading videos…</div>
+  <div class="controls">
+    <button id="previous" type="button">Previous</button>
+    <button id="next" type="button">Next</button>
+    <span id="status" role="status"></span>
+  </div>
+<script>
+(() => {
+  const token = new URLSearchParams(location.search).get('token');
+  const player = document.getElementById('player');
+  const status = document.getElementById('status');
+  const now = document.getElementById('now');
+  const channel = document.getElementById('channel');
+  let videos = [];
+  let current = 0;
+  if (window.Telegram?.WebApp) {
+    window.Telegram.WebApp.ready();
+    window.Telegram.WebApp.expand();
+  }
+  if (!token) {
+    status.textContent = 'Open the private player link supplied by the server.';
+    document.getElementById('previous').disabled = true;
+    document.getElementById('next').disabled = true;
+    return;
+  }
+  const play = (index, autoplay = true) => {
+    if (!videos.length) return;
+    current = (index + videos.length) % videos.length;
+    now.textContent = `${current + 1} of ${videos.length}: ${videos[current].title}`;
+    player.src = videos[current].url;
+    if (autoplay) player.play().catch(() => {
+      status.textContent = 'Tap Play to start; the next videos will advance automatically.';
+    });
+  };
+  document.getElementById('previous').addEventListener('click', () => play(current - 1));
+  document.getElementById('next').addEventListener('click', () => play(current + 1));
+  player.addEventListener('ended', () => {
+    if (current + 1 < videos.length) play(current + 1);
+    else status.textContent = 'Playlist finished.';
+  });
+  fetch(`/api/playlist?token=${encodeURIComponent(token)}`, { cache: 'no-store' })
+    .then(response => {
+      if (!response.ok) throw new Error('The private playlist link is invalid or expired.');
+      return response.json();
+    })
+    .then(data => {
+      videos = data.videos || [];
+      channel.textContent = data.channel || 'Telegram channel';
+      if (!videos.length) throw new Error('No videos are available in this playlist.');
+      play(0, false);
+      status.textContent = 'Press Play to start. Videos advance automatically.';
+    })
+    .catch(error => {
+      now.textContent = error.message;
+      status.textContent = '';
+    });
+})();
+</script>
+</body>
+</html>

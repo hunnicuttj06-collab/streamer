@@ -1,6 +1,7 @@
-target/
+# Copy .env.example to .env; never commit the filled-in .env file.
+.env
 .tools/
 .state/
 .data/
-.env
 *.log
+target/
